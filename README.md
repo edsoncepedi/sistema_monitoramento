@@ -1,9 +1,9 @@
-# Dashboard de aceleração – ESP32/ESP8266 + Flask + PostgreSQL
+# Dashboard de aceleração – ESP32/ESP8266 + Flask + TimescaleDB
 
-O microcontrolador lê o MPU6050 e envia lotes de leituras (X/Y/Z, em m/s²) por HTTP POST para uma API Flask. A API grava no PostgreSQL e serve um dashboard com gráfico em tempo real, histórico, estatísticas e exportação em CSV.
+O microcontrolador lê o MPU6050 e envia lotes de leituras (X/Y/Z, em m/s²) por HTTP POST para uma API Flask. A API grava no TimescaleDB (PostgreSQL com extensão para séries temporais) e serve um dashboard com gráfico em tempo real, histórico, estatísticas e exportação em CSV.
 
 ```
-ESP32 / ESP8266 ──POST /api/leituras──▶ Flask (gunicorn) ──▶ PostgreSQL
+ESP32 / ESP8266 ──POST /api/leituras──▶ Flask (gunicorn) ──▶ TimescaleDB
                                          │
                        navegador ◀── dashboard (/)
 ```
@@ -19,7 +19,7 @@ docker compose up --build -d
 
 - Dashboard: http://localhost:5000
 - Logs: `docker compose logs -f web`
-- Parar: `docker compose down` (os dados ficam no volume `pgdata`; `down -v` apaga tudo)
+- Parar: `docker compose down` (os dados ficam no volume `tsdata`; `down -v` apaga tudo)
 
 Para testar sem o hardware, use o simulador em outro terminal:
 
@@ -77,9 +77,38 @@ Formato do POST:
 
 `t` e `enviado_ms` são o `millis()` do microcontrolador. O servidor calcula o horário de cada amostra como `agora - (enviado_ms - t)`, então a placa não precisa de RTC nem de NTP. A latência da rede, normalmente de algumas dezenas de ms, entra como erro nesse horário.
 
+## 4. Banco de dados (TimescaleDB)
+
+A estrutura é criada automaticamente quando o app sobe ([app/timescale.py](app/timescale.py)):
+
+- **`leituras`** é uma *hypertable*, particionada em chunks de 1 dia. Consultas por período leem só os chunks daquele período.
+- **Compressão:** chunks com mais de 7 dias são comprimidos automaticamente, segmentados por dispositivo. No teste, os dados ficaram cerca de 12 vezes menores.
+- **`leituras_1s`** é um *agregado contínuo*: contagem, mín/máx, Σx e Σx² por dispositivo por segundo, atualizado a cada minuto. Históricos e estatísticas de períodos maiores que 1 h usam esse agregado, e períodos menores leem os dados brutos.
+- Nenhuma leitura é apagada automaticamente. Se quiser descartar dados brutos antigos, por exemplo com mais de 90 dias:
+  `SELECT add_retention_policy('leituras', INTERVAL '90 days');`
+
+`UPDATE` ou `DELETE` em muitos dados antigos (já comprimidos) é recusado por padrão. Para liberar só na sessão atual, rode antes:
+`SET timescaledb.max_tuples_decompressed_per_dml_transaction = 0;`
+
+### Migrar uma instalação antiga (Postgres puro → TimescaleDB)
+
+Instalações anteriores guardavam os dados no volume `pgdata`, com Postgres puro. Depois do `git pull`, e **antes** de qualquer `docker compose up`, rode:
+
+```bash
+bash scripts/migrar_para_timescale.sh
+```
+
+O script segue estes passos:
+1. Faz backup completo em `backups/`.
+2. Recria o banco com TimescaleDB num volume novo, `tsdata`.
+3. Copia as leituras e confere a contagem.
+4. Sobe o web de novo.
+
+O serviço fica parado alguns minutos, e os lotes que a placa enviar nesse intervalo são descartados. O volume `pgdata` não é alterado, então para voltar atrás basta `git checkout <commit anterior> && docker compose up -d --build`.
+
 ## Rodar sem Docker (desenvolvimento)
 
-Com um PostgreSQL local:
+Com um PostgreSQL local que tenha a extensão TimescaleDB:
 
 ```powershell
 python -m venv .venv

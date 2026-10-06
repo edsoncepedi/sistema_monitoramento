@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import func, insert, select
 
-from .models import Leitura, db
+from .models import Leitura, Leitura1s, db
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -15,7 +15,7 @@ MAX_LOTE = 500           # leituras aceitas por POST
 MAX_PONTOS = 2000        # acima disso o histórico é agregado em baldes de tempo
 LIMITE_RECENTES = 20000  # teto de pontos por resposta do modo tempo real
 MAX_ATRASO_MS = 3_600_000
-ORIGEM_BALDES = datetime(2000, 1, 1, tzinfo=timezone.utc)
+LIMIAR_AGREGADO = timedelta(hours=1)  # períodos maiores usam o agregado por segundo
 
 
 class ErroRequisicao(ValueError):
@@ -49,22 +49,41 @@ def _parse_dt(valor, nome):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _filtros():
-    """Condições WHERE a partir de ?inicio=&fim=&device_id=."""
+def _params():
+    """Lê ?inicio=&fim=&device_id=."""
     inicio = _parse_dt(request.args.get("inicio"), "inicio")
     fim = _parse_dt(request.args.get("fim"), "fim")
     if inicio and fim and inicio > fim:
         raise ErroRequisicao("'inicio' deve ser anterior a 'fim'")
-    device = request.args.get("device_id") or None
+    return inicio, fim, request.args.get("device_id") or None
 
+
+def _conds(col_ts, col_device, inicio, fim, device):
     conds = []
     if inicio:
-        conds.append(Leitura.ts >= inicio)
+        conds.append(col_ts >= inicio)
     if fim:
-        conds.append(Leitura.ts <= fim)
+        conds.append(col_ts <= fim)
     if device:
-        conds.append(Leitura.device_id == device)
+        conds.append(col_device == device)
     return conds
+
+
+def _conds_brutos(inicio, fim, device):
+    return _conds(Leitura.ts, Leitura.device_id, inicio, fim, device)
+
+
+def _conds_agregado(inicio, fim, device):
+    # Baldes de 1 s: inclui o balde que contém 'inicio'.
+    inicio_balde = inicio.replace(microsecond=0) if inicio else None
+    return _conds(Leitura1s.bucket, Leitura1s.device_id, inicio_balde, fim, device)
+
+
+def _usa_agregado(inicio, fim):
+    """Períodos longos (ou sem início) são lidos do agregado contínuo leituras_1s."""
+    if inicio is None:
+        return True
+    return (fim or datetime.now(timezone.utc)) - inicio > LIMIAR_AGREGADO
 
 
 # --------------------------------------------------------------------------- ingestão
@@ -128,13 +147,14 @@ def receber_leituras():
 
 @api_bp.get("/dispositivos")
 def listar_dispositivos():
+    A = Leitura1s
     stmt = (
-        select(Leitura.device_id, func.count(), func.max(Leitura.ts))
-        .group_by(Leitura.device_id)
-        .order_by(Leitura.device_id)
+        select(A.device_id, func.sum(A.n), func.max(A.bucket))
+        .group_by(A.device_id)
+        .order_by(A.device_id)
     )
     return jsonify([
-        {"device_id": d, "total": total, "ultima": _ms(ultima)}
+        {"device_id": d, "total": int(total), "ultima": _ms(ultima)}
         for d, total, ultima in db.session.execute(stmt)
     ])
 
@@ -142,30 +162,57 @@ def listar_dispositivos():
 @api_bp.get("/leituras")
 def listar_leituras():
     """Pontos para o gráfico do histórico; agrega por média se passar de MAX_PONTOS."""
-    conds = _filtros()
-    total, primeiro, ultimo = db.session.execute(
-        select(func.count(), func.min(Leitura.ts), func.max(Leitura.ts)).where(*conds)
-    ).one()
+    inicio, fim, device = _params()
+    brutos = _conds_brutos(inicio, fim, device)
 
-    if total <= MAX_PONTOS:
-        stmt = select(Leitura.ts, Leitura.x, Leitura.y, Leitura.z).where(*conds).order_by(Leitura.ts)
-        balde_s = None
+    if _usa_agregado(inicio, fim):
+        A = Leitura1s
+        conds = _conds_agregado(inicio, fim, device)
+        total, primeiro, ultimo = db.session.execute(
+            select(func.sum(A.n), func.min(A.bucket), func.max(A.bucket)).where(*conds)
+        ).one()
+        total = int(total or 0)
+        if total > MAX_PONTOS:
+            balde = max((ultimo - primeiro) / MAX_PONTOS, timedelta(seconds=1))
+            b = func.time_bucket(balde, A.bucket).label("b")
+            n = func.sum(A.n)
+            stmt = (
+                select(b, func.sum(A.x_soma) / n, func.sum(A.y_soma) / n, func.sum(A.z_soma) / n)
+                .where(*conds)
+                .group_by(b)
+                .order_by(b)
+            )
+            return _resposta_pontos(stmt, total, balde)
     else:
-        balde = max((ultimo - primeiro) / MAX_PONTOS, timedelta(milliseconds=1))
-        balde_s = balde.total_seconds()
-        bucket = func.date_bin(balde, Leitura.ts, ORIGEM_BALDES).label("bucket")
-        stmt = (
-            select(bucket, func.avg(Leitura.x), func.avg(Leitura.y), func.avg(Leitura.z))
-            .where(*conds)
-            .group_by(bucket)
-            .order_by(bucket)
-        )
+        total, primeiro, ultimo = db.session.execute(
+            select(func.count(), func.min(Leitura.ts), func.max(Leitura.ts)).where(*brutos)
+        ).one()
+        if total > MAX_PONTOS:
+            balde = max((ultimo - primeiro) / MAX_PONTOS, timedelta(milliseconds=1))
+            b = func.time_bucket(balde, Leitura.ts).label("b")
+            stmt = (
+                select(b, func.avg(Leitura.x), func.avg(Leitura.y), func.avg(Leitura.z))
+                .where(*brutos)
+                .group_by(b)
+                .order_by(b)
+            )
+            return _resposta_pontos(stmt, total, balde)
 
+    stmt = select(Leitura.ts, Leitura.x, Leitura.y, Leitura.z).where(*brutos).order_by(Leitura.ts)
+    return _resposta_pontos(stmt, total, None)
+
+
+def _resposta_pontos(stmt, total, balde):
     pontos = [
-        {"t": _ms(ts), "x": round(x, 4), "y": round(y, 4), "z": round(z, 4)}
+        {"t": _ms(ts), "x": round(float(x), 4), "y": round(float(y), 4), "z": round(float(z), 4)}
         for ts, x, y, z in db.session.execute(stmt)
     ]
-    return jsonify({"total": total, "agregado": balde_s is not None, "balde_s": balde_s, "pontos": pontos})
+    return jsonify({
+        "total": total,
+        "agregado": balde is not None,
+        "balde_s": balde.total_seconds() if balde else None,
+        "pontos": pontos,
+    })
 
 
 @api_bp.get("/leituras/recentes")
@@ -183,7 +230,14 @@ def leituras_recentes():
     colunas = (Leitura.id, Leitura.ts, Leitura.x, Leitura.y, Leitura.z)
 
     if apos_id:
-        stmt = select(*colunas).where(*conds, Leitura.id > apos_id).order_by(Leitura.id)
+        # Leituras novas têm ts >= recebimento - MAX_ATRASO_MS; o limite deixa o
+        # TimescaleDB ler só os chunks recentes em vez de todos.
+        limite = datetime.now(timezone.utc) - timedelta(milliseconds=MAX_ATRASO_MS, minutes=10)
+        stmt = (
+            select(*colunas)
+            .where(*conds, Leitura.id > apos_id, Leitura.ts >= limite)
+            .order_by(Leitura.id)
+        )
     else:
         ultimo_ts = db.session.scalar(select(func.max(Leitura.ts)).where(*conds))
         if ultimo_ts is None:
@@ -200,25 +254,59 @@ def leituras_recentes():
     return jsonify({"ultimo_id": ultimo_id, "pontos": pontos})
 
 
-@api_bp.get("/estatisticas")
-def estatisticas():
-    conds = _filtros()
-    eixos = (Leitura.x, Leitura.y, Leitura.z)
+def _f(v):
+    return None if v is None else float(v)
+
+
+def _estatisticas_brutas(conds):
     agregados = [func.count()]
-    for col in eixos:
+    for col in (Leitura.x, Leitura.y, Leitura.z):
         agregados += [func.min(col), func.max(col), func.avg(col), func.stddev_samp(col)]
     linha = db.session.execute(select(*agregados).where(*conds)).one()
 
-    def _f(v):
-        return None if v is None else float(v)
-
-    resultado = {"total": linha[0], "eixos": {}}
+    eixos = {}
     for i, nome in enumerate("xyz"):
         mn, mx, media, desvio = linha[1 + i * 4: 5 + i * 4]
-        resultado["eixos"][nome] = {"min": _f(mn), "max": _f(mx), "media": _f(media), "desvio": _f(desvio)}
+        eixos[nome] = {"min": _f(mn), "max": _f(mx), "media": _f(media), "desvio": _f(desvio)}
+    return linha[0], eixos
+
+
+def _estatisticas_agregadas(conds):
+    """Combina os baldes de 1 s: média = Σx/n, variância = (Σx² - (Σx)²/n)/(n-1)."""
+    A = Leitura1s
+    agregados = [func.sum(A.n)]
+    for e in "xyz":
+        agregados += [
+            func.min(getattr(A, f"{e}_min")), func.max(getattr(A, f"{e}_max")),
+            func.sum(getattr(A, f"{e}_soma")), func.sum(getattr(A, f"{e}_quad")),
+        ]
+    linha = db.session.execute(select(*agregados).where(*conds)).one()
+    n = int(linha[0] or 0)
+
+    eixos = {}
+    for i, nome in enumerate("xyz"):
+        mn, mx, soma, quad = (_f(v) for v in linha[1 + i * 4: 5 + i * 4])
+        media = soma / n if n else None
+        desvio = math.sqrt(max((quad - soma * soma / n) / (n - 1), 0.0)) if n > 1 else None
+        eixos[nome] = {"min": mn, "max": mx, "media": media, "desvio": desvio}
+    return n, eixos
+
+
+@api_bp.get("/estatisticas")
+def estatisticas():
+    inicio, fim, device = _params()
+    brutos = _conds_brutos(inicio, fim, device)
+    if _usa_agregado(inicio, fim):
+        total, eixos = _estatisticas_agregadas(_conds_agregado(inicio, fim, device))
+    else:
+        total, eixos = _estatisticas_brutas(brutos)
+    resultado = {"total": total, "eixos": eixos}
 
     ultima = db.session.execute(
-        select(Leitura.ts, *eixos).where(*conds).order_by(Leitura.ts.desc()).limit(1)
+        select(Leitura.ts, Leitura.x, Leitura.y, Leitura.z)
+        .where(*brutos)
+        .order_by(Leitura.ts.desc())
+        .limit(1)
     ).first()
     resultado["ultima"] = (
         {"t": _ms(ultima.ts), "x": ultima.x, "y": ultima.y, "z": ultima.z} if ultima else None
@@ -229,7 +317,7 @@ def estatisticas():
 @api_bp.get("/leituras.csv")
 def exportar_csv():
     """CSV em streaming. ?excel=1 usa ';' e vírgula decimal (Excel em português)."""
-    conds = _filtros()
+    conds = _conds_brutos(*_params())
     excel = request.args.get("excel") == "1"
     sep = ";" if excel else ","
 
