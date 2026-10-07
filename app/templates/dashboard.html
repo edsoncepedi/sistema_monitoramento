@@ -59,7 +59,29 @@
         <h2>Aceleração (m/s²)</h2>
         <span id="nota-grafico" class="sub"></span>
       </div>
-      <div class="grafico"><canvas id="grafico"></canvas></div>
+      <div id="ferramentas" class="ferramentas" hidden>
+        <div class="grupo" role="group" aria-label="Período rápido">
+          <button type="button" class="opcao" data-minutos="15">15 min</button>
+          <button type="button" class="opcao" data-minutos="60">1 h</button>
+          <button type="button" class="opcao" data-minutos="360">6 h</button>
+          <button type="button" class="opcao" data-minutos="1440">24 h</button>
+          <button type="button" class="opcao" data-minutos="10080">7 d</button>
+        </div>
+        <div class="grupo" role="group" aria-label="Navegar no período">
+          <button type="button" class="opcao" id="anterior" title="Recuar meio período" aria-label="Recuar meio período">◀</button>
+          <button type="button" class="opcao" id="afastar" title="Dobrar o período visível">Afastar</button>
+          <button type="button" class="opcao" id="proximo" title="Avançar meio período" aria-label="Avançar meio período">▶</button>
+        </div>
+        <div class="grupo" role="group" aria-label="Zoom">
+          <button type="button" class="opcao" id="voltar" title="Desfazer o último zoom ou deslocamento (duplo clique no gráfico)">Voltar</button>
+          <button type="button" class="opcao" id="redefinir" title="Voltar ao período original">Redefinir</button>
+        </div>
+      </div>
+      <div class="grafico">
+        <canvas id="grafico"></canvas>
+        <div id="selecao" class="selecao" hidden></div>
+      </div>
+      <p id="dica-grafico" class="dica"></p>
     </section>
 
     <section class="painel">

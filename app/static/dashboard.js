@@ -4,12 +4,16 @@ const JANELA_MS = 60_000;          // largura da janela do modo tempo real
 const INTERVALO_PONTOS_MS = 1_000; // polling de pontos novos
 const INTERVALO_STATS_MS = 5_000;  // polling dos cards/tabela
 const INTERVALO_DISPOSITIVOS_MS = 15_000;
+const ZOOM_MIN_MS = 500;           // menor trecho que o zoom do histórico aceita
+const ARRASTO_MIN_PX = 6;          // abaixo disso o arrasto é tratado como clique
 
 const estado = {
   modo: "tempo-real",
   device: null,
   dispositivos: [],
   ultimoId: 0,
+  periodo: null,     // {inicio, fim} em ms do histórico; os inputs só guardam segundos
+  zoom: [],          // períodos anteriores, para "Voltar"
   geracao: 0,        // invalida respostas antigas quando o modo/dispositivo muda
   timers: [],
 };
@@ -17,6 +21,7 @@ const estado = {
 const $ = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 const fmtInt = new Intl.NumberFormat("pt-BR");
+const fmtCurto = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 });
 const fmtHora = new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "medium" });
 
 // --------------------------------------------------------------------------- utilitários
@@ -54,8 +59,13 @@ function paraInputLocal(data) {
   const local = new Date(data.getTime() - data.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 19);
 }
-function deInputLocal(valor) {
-  return valor ? new Date(valor).toISOString() : null;
+
+function fmtDuracao(ms) {
+  const s = ms / 1000;
+  if (s < 60) return `${fmtCurto.format(s)} s`;
+  if (s < 3600) return `${fmtCurto.format(s / 60)} min`;
+  if (s < 172_800) return `${fmtCurto.format(s / 3600)} h`;
+  return `${fmtCurto.format(s / 86_400)} dias`;
 }
 
 function cssVar(nome) {
@@ -152,7 +162,8 @@ function cortarJanela() {
 
 function periodoAtual() {
   if (estado.modo === "historico") {
-    return { inicio: deInputLocal($("inicio").value), fim: deInputLocal($("fim").value) };
+    const p = estado.periodo;
+    return { inicio: new Date(p.inicio).toISOString(), fim: new Date(p.fim).toISOString() };
   }
   const dados = grafico.data.datasets[0].data;
   const ultimo = dados.length ? dados[dados.length - 1].x : null;
@@ -239,6 +250,8 @@ function iniciarTempoReal() {
   const geracao = ++estado.geracao;
   pararTimers();
   estado.ultimoId = 0;
+  const x = grafico.options.scales.x;
+  x.min = x.max = undefined;
   limparGrafico();
   if (!estado.device) return;
   repetir(buscarPontosRecentes, INTERVALO_PONTOS_MS, geracao);
@@ -248,20 +261,29 @@ function iniciarTempoReal() {
 async function carregarHistorico() {
   const geracao = ++estado.geracao;
   pararTimers();
+  atualizarFerramentas();
   if (!estado.device) return;
 
-  const periodo = periodoAtual();
+  // Fixa o eixo no período pedido: o zoom aparece na hora, com os dados que já
+  // estão na tela, e é refinado quando chega a resposta com mais resolução.
+  const p = estado.periodo;
+  const x = grafico.options.scales.x;
+  x.min = p.inicio;
+  x.max = p.fim;
+  grafico.update("none");
+
   setStatus("Carregando histórico…");
   try {
-    const dados = await getJSON("/api/leituras?" + qs({ device_id: estado.device, ...periodo }));
+    const dados = await getJSON("/api/leituras?" + qs({ device_id: estado.device, ...periodoAtual() }));
     if (geracao !== estado.geracao) return;
     limparGrafico();
     adicionarPontos(dados.pontos);
     grafico.update("none");
 
+    const leituras = `${fmtDuracao(p.fim - p.inicio)} · ${fmtInt.format(dados.total)} leituras`;
     $("nota-grafico").textContent = dados.agregado
-      ? `${fmtInt.format(dados.total)} leituras · média a cada ${fmt.format(dados.balde_s)} s`
-      : `${fmtInt.format(dados.total)} leituras`;
+      ? `${leituras} · média a cada ${fmt.format(dados.balde_s)} s`
+      : leituras;
     await atualizarEstatisticas(geracao);
     setStatus("Histórico carregado");
   } catch (e) {
@@ -273,18 +295,156 @@ function trocarModo(modo) {
   estado.modo = modo;
   document.querySelectorAll(".aba").forEach((b) => b.classList.toggle("ativa", b.dataset.modo === modo));
   $("controles-historico").hidden = modo !== "historico";
+  $("ferramentas").hidden = modo !== "historico";
+  $("dica-grafico").textContent = modo === "historico"
+    ? "Arraste sobre o gráfico para ampliar um trecho · duplo clique para voltar · clique na legenda para ocultar um eixo"
+    : "Arraste sobre o gráfico para congelar um trecho e analisá-lo no histórico · clique na legenda para ocultar um eixo";
 
   if (modo === "historico") {
-    if (!$("inicio").value || !$("fim").value) {
-      const agora = new Date();
-      $("fim").value = paraInputLocal(agora);
-      $("inicio").value = paraInputLocal(new Date(agora.getTime() - 3_600_000));
+    if (!estado.periodo) {
+      const agora = Date.now();
+      definirPeriodo({ inicio: agora - 3_600_000, fim: agora });
     }
     carregarHistorico();
   } else {
     iniciarTempoReal();
   }
 }
+
+// --------------------------------------------------------------------------- navegação do histórico
+
+function definirPeriodo(p) {
+  estado.periodo = { inicio: Math.round(p.inicio), fim: Math.round(p.fim) };
+  $("inicio").value = paraInputLocal(new Date(estado.periodo.inicio));
+  $("fim").value = paraInputLocal(new Date(estado.periodo.fim));
+}
+
+function lerPeriodoInputs() {
+  const inicio = Date.parse($("inicio").value);
+  const fim = Date.parse($("fim").value);
+  if (!Number.isFinite(inicio) || !Number.isFinite(fim)) throw new Error("Preencha início e fim");
+  if (inicio >= fim) throw new Error("O início deve ser anterior ao fim");
+  return { inicio, fim };
+}
+
+// Período novo (inputs ou atalho): descarta o histórico de zoom.
+function novoPeriodo(p) {
+  estado.zoom = [];
+  definirPeriodo(p);
+  carregarHistorico();
+}
+
+// Zoom/deslocamento: guarda o período atual para "Voltar".
+function irPara(p) {
+  estado.zoom.push(estado.periodo);
+  definirPeriodo(p);
+  carregarHistorico();
+}
+
+function voltar() {
+  if (!estado.zoom.length) return;
+  definirPeriodo(estado.zoom.pop());
+  carregarHistorico();
+}
+
+function redefinir() {
+  if (!estado.zoom.length) return;
+  definirPeriodo(estado.zoom[0]);
+  estado.zoom = [];
+  carregarHistorico();
+}
+
+function deslocar(fracao) {
+  const { inicio, fim } = estado.periodo;
+  const passo = (fim - inicio) * fracao;
+  irPara({ inicio: inicio + passo, fim: fim + passo });
+}
+
+function afastar() {
+  const { inicio, fim } = estado.periodo;
+  const meio = (fim - inicio) / 2;
+  irPara({ inicio: inicio - meio, fim: fim + meio });
+}
+
+function atualizarFerramentas() {
+  $("voltar").disabled = $("redefinir").disabled = !estado.zoom.length;
+}
+
+function selecionarTrecho(inicio, fim) {
+  if (fim - inicio < ZOOM_MIN_MS) {
+    const meio = (inicio + fim) / 2;
+    inicio = meio - ZOOM_MIN_MS / 2;
+    fim = meio + ZOOM_MIN_MS / 2;
+  }
+  if (estado.modo === "historico") {
+    irPara({ inicio, fim });
+    return;
+  }
+  // No tempo real, congela o trecho no histórico; "Voltar" mostra a janela inteira.
+  const x = grafico.scales.x;
+  estado.zoom = [{ inicio: Math.round(x.min), fim: Math.round(x.max) }];
+  definirPeriodo({ inicio, fim });
+  trocarModo("historico");
+}
+
+// --------------------------------------------------------------------------- seleção por arrasto
+
+let arrasto = null;
+
+function posicaoNoCanvas(e) {
+  const r = grafico.canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function desenharSelecao() {
+  const a = grafico.chartArea;
+  const el = $("selecao");
+  el.style.left = `${Math.min(arrasto.x0, arrasto.x1)}px`;
+  el.style.width = `${Math.abs(arrasto.x1 - arrasto.x0)}px`;
+  el.style.top = `${a.top}px`;
+  el.style.height = `${a.bottom - a.top}px`;
+  el.hidden = false;
+}
+
+function encerrarArrasto() {
+  arrasto = null;
+  $("selecao").hidden = true;
+}
+
+grafico.canvas.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || !estado.device) return;
+  if (estado.modo === "tempo-real" && !grafico.data.datasets[0].data.length) return;
+  const { x, y } = posicaoNoCanvas(e);
+  const a = grafico.chartArea;
+  if (x < a.left || x > a.right || y < a.top || y > a.bottom) return;
+  arrasto = { x0: x, x1: x };
+  grafico.canvas.setPointerCapture(e.pointerId);
+});
+
+grafico.canvas.addEventListener("pointermove", (e) => {
+  if (!arrasto) return;
+  const a = grafico.chartArea;
+  arrasto.x1 = Math.min(Math.max(posicaoNoCanvas(e).x, a.left), a.right);
+  desenharSelecao();
+});
+
+grafico.canvas.addEventListener("pointerup", () => {
+  if (!arrasto) return;
+  const esq = Math.min(arrasto.x0, arrasto.x1);
+  const dir = Math.max(arrasto.x0, arrasto.x1);
+  encerrarArrasto();
+  if (dir - esq < ARRASTO_MIN_PX) return;
+  const x = grafico.scales.x;
+  selecionarTrecho(x.getValueForPixel(esq), x.getValueForPixel(dir));
+});
+
+grafico.canvas.addEventListener("pointercancel", encerrarArrasto);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && arrasto) encerrarArrasto();
+});
+grafico.canvas.addEventListener("dblclick", () => {
+  if (estado.modo === "historico") voltar();
+});
 
 function recarregar() {
   if (estado.modo === "historico") carregarHistorico();
@@ -326,7 +486,23 @@ $("dispositivo").addEventListener("change", (e) => {
   recarregar();
 });
 document.querySelectorAll(".aba").forEach((b) => b.addEventListener("click", () => trocarModo(b.dataset.modo)));
-$("aplicar").addEventListener("click", carregarHistorico);
+$("aplicar").addEventListener("click", () => {
+  try {
+    novoPeriodo(lerPeriodoInputs());
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+});
+document.querySelectorAll("[data-minutos]").forEach((b) => b.addEventListener("click", () => {
+  const agora = Date.now();
+  novoPeriodo({ inicio: agora - Number(b.dataset.minutos) * 60_000, fim: agora });
+}));
+$("anterior").addEventListener("click", () => deslocar(-0.5));
+$("proximo").addEventListener("click", () => deslocar(0.5));
+$("afastar").addEventListener("click", afastar);
+$("voltar").addEventListener("click", voltar);
+$("redefinir").addEventListener("click", redefinir);
 
+trocarModo("tempo-real");
 atualizarDispositivos();
 setInterval(atualizarDispositivos, INTERVALO_DISPOSITIVOS_MS);
