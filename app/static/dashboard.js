@@ -10,8 +10,6 @@ const LARGURA_EIXO_Y = 64;         // fixa para os gráficos empilhados ficarem 
 
 // Cada bloco é um tipo de medição, com seu próprio dispositivo, rotas e gráficos.
 // Modo (tempo real/histórico), período e zoom são compartilhados por todos.
-// lacunaMs: dois pontos mais distantes que isso não são ligados por linha
-// (o dispositivo ficou sem enviar). Fica acima das pausas normais da amostragem.
 const BLOCOS = [
   {
     id: "acel",
@@ -28,7 +26,6 @@ const BLOCOS = [
       { chave: "z", rotulo: "Z", unidade: "m/s²", cor: "--serie-z", casas: 3 },
     ],
     graficos: [{ canvas: "acel-grafico", campos: ["x", "y", "z"] }],
-    lacunaMs: 1_000,  // amostra a cada 10 ms; o POST pausa a leitura por ~100–300 ms
   },
   {
     id: "energia",
@@ -49,7 +46,6 @@ const BLOCOS = [
       { canvas: "energia-corrente", campos: ["corrente"] },
       { canvas: "energia-potencia", campos: ["potencia"] },
     ],
-    lacunaMs: 3_000,  // 1 amostra/s; tolera uma leitura perdida do PZEM
   },
 ];
 
@@ -117,16 +113,6 @@ function cssVar(nome) {
 
 // --------------------------------------------------------------------------- gráficos
 
-// Sem vizinho próximo dos dois lados, o ponto fica sem linha: desenha o marcador
-// para que uma leitura solta entre duas falhas não suma do gráfico.
-function pontoIsolado(ctx) {
-  const dados = ctx.dataset.data;
-  const i = ctx.dataIndex;
-  const lacuna = ctx.dataset.spanGaps;
-  const longe = (j) => j < 0 || j >= dados.length || Math.abs(dados[j].x - dados[i].x) > lacuna;
-  return dados.length > 1 && longe(i - 1) && longe(i + 1);
-}
-
 function criarGrafico(canvas, campos) {
   const unidade = campos[0].unidade;
   const grafico = new Chart(canvas, {
@@ -136,7 +122,7 @@ function criarGrafico(canvas, campos) {
         label: c.rotulo,
         data: [],
         borderWidth: 2,
-        pointRadius: (ctx) => (pontoIsolado(ctx) ? 2 : 0),
+        pointRadius: 0,
         pointHoverRadius: 4,
         tension: 0,
       })),
@@ -233,11 +219,6 @@ function aplicarCores() {
 }
 aplicarCores();
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", aplicarCores);
-
-// spanGaps numérico: o Chart.js interrompe a linha entre pontos mais distantes que isso (ms).
-function definirLacuna(bloco, ms) {
-  for (const g of bloco.graficos) g.data.datasets.forEach((ds) => { ds.spanGaps = ms; });
-}
 
 function atualizarGraficos(bloco) {
   bloco.graficos.forEach((g) => g.update("none"));
@@ -382,7 +363,6 @@ function iniciarTempoReal() {
   fixarEixoX(undefined, undefined);
   for (const bloco of BLOCOS) {
     bloco.ultimoId = 0;
-    definirLacuna(bloco, bloco.lacunaMs);
     limparGraficos(bloco);
     if (!bloco.device) continue;
     repetir((g) => buscarPontosRecentes(bloco, g), INTERVALO_PONTOS_MS, geracao);
@@ -394,8 +374,6 @@ async function carregarHistoricoBloco(bloco, geracao) {
   const p = estado.periodo;
   const dados = await getJSON(bloco.rotas.pontos + "?" + qs({ device_id: bloco.device, ...periodoAtual(bloco) }));
   if (geracao !== estado.geracao) return;
-  // Agregado: os pontos são médias espaçadas de um balde; falta de um balde inteiro é lacuna.
-  definirLacuna(bloco, dados.agregado ? Math.max(bloco.lacunaMs, 1.5 * dados.balde_s * 1000) : bloco.lacunaMs);
   limparGraficos(bloco);
   adicionarPontos(bloco, dados.pontos);
   atualizarGraficos(bloco);
