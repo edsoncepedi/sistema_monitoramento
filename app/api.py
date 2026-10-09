@@ -2,12 +2,13 @@ import csv
 import hmac
 import io
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import func, insert, select
 
-from .models import Leitura, Leitura1s, db
+from .models import Leitura, Leitura1s, LeituraEnergia, LeituraEnergia1s, db
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -16,6 +17,22 @@ MAX_PONTOS = 2000        # acima disso o histórico é agregado em baldes de tem
 LIMITE_RECENTES = 20000  # teto de pontos por resposta do modo tempo real
 MAX_ATRASO_MS = 3_600_000
 LIMIAR_AGREGADO = timedelta(hours=1)  # períodos maiores usam o agregado por segundo
+
+
+@dataclass(frozen=True)
+class Grandeza:
+    """Um tipo de medição: tabela bruta, agregado por segundo e colunas medidas."""
+    nome: str        # prefixo do arquivo CSV
+    bruto: type
+    agregado: type
+    campos: tuple
+
+    def colunas(self, modelo):
+        return [getattr(modelo, c) for c in self.campos]
+
+
+ACELERACAO = Grandeza("leituras", Leitura, Leitura1s, ("x", "y", "z"))
+ENERGIA = Grandeza("energia", LeituraEnergia, LeituraEnergia1s, ("tensao", "corrente", "potencia"))
 
 
 class ErroRequisicao(ValueError):
@@ -69,31 +86,93 @@ def _conds(col_ts, col_device, inicio, fim, device):
     return conds
 
 
-def _conds_brutos(inicio, fim, device):
-    return _conds(Leitura.ts, Leitura.device_id, inicio, fim, device)
+def _conds_brutos(g, inicio, fim, device):
+    return _conds(g.bruto.ts, g.bruto.device_id, inicio, fim, device)
 
 
-def _conds_agregado(inicio, fim, device):
+def _conds_agregado(g, inicio, fim, device):
     # Baldes de 1 s: inclui o balde que contém 'inicio'.
     inicio_balde = inicio.replace(microsecond=0) if inicio else None
-    return _conds(Leitura1s.bucket, Leitura1s.device_id, inicio_balde, fim, device)
+    return _conds(g.agregado.bucket, g.agregado.device_id, inicio_balde, fim, device)
 
 
 def _usa_agregado(inicio, fim):
-    """Períodos longos (ou sem início) são lidos do agregado contínuo leituras_1s."""
+    """Períodos longos (ou sem início) são lidos do agregado contínuo <tabela>_1s."""
     if inicio is None:
         return True
     return (fim or datetime.now(timezone.utc)) - inicio > LIMIAR_AGREGADO
 
 
-# --------------------------------------------------------------------------- ingestão
+# --------------------------------------------------------------------------- rotas
 
 @api_bp.post("/leituras")
 def receber_leituras():
-    """Recebe um lote do microcontrolador.
+    """Corpo: {"device_id": "esp32-01", "enviado_ms": 123456,
+               "leituras": [{"t": 122960, "x": 0.12, "y": -9.81, "z": 0.5}, ...]}"""
+    return _receber(ACELERACAO)
 
-    Corpo: {"device_id": "esp32-01", "enviado_ms": 123456,
-            "leituras": [{"t": 122960, "x": 0.12, "y": -9.81, "z": 0.5}, ...]}
+
+@api_bp.post("/energia")
+def receber_energia():
+    """Corpo: {"device_id": "esp32-energia-01", "enviado_ms": 123456,
+               "leituras": [{"t": 122960, "tensao": 220.1, "corrente": 1.234, "potencia": 250.3}, ...]}"""
+    return _receber(ENERGIA)
+
+
+@api_bp.get("/dispositivos")
+def listar_dispositivos():
+    return _dispositivos(ACELERACAO)
+
+
+@api_bp.get("/energia/dispositivos")
+def listar_dispositivos_energia():
+    return _dispositivos(ENERGIA)
+
+
+@api_bp.get("/leituras")
+def listar_leituras():
+    return _pontos(ACELERACAO)
+
+
+@api_bp.get("/energia")
+def listar_energia():
+    return _pontos(ENERGIA)
+
+
+@api_bp.get("/leituras/recentes")
+def leituras_recentes():
+    return _recentes(ACELERACAO)
+
+
+@api_bp.get("/energia/recentes")
+def energia_recentes():
+    return _recentes(ENERGIA)
+
+
+@api_bp.get("/estatisticas")
+def estatisticas():
+    return _estatisticas(ACELERACAO)
+
+
+@api_bp.get("/energia/estatisticas")
+def estatisticas_energia():
+    return _estatisticas(ENERGIA)
+
+
+@api_bp.get("/leituras.csv")
+def exportar_csv():
+    return _csv(ACELERACAO)
+
+
+@api_bp.get("/energia.csv")
+def exportar_csv_energia():
+    return _csv(ENERGIA)
+
+
+# --------------------------------------------------------------------------- ingestão
+
+def _receber(g):
+    """Recebe um lote do microcontrolador.
 
     't' e 'enviado_ms' são millis() do microcontrolador; o horário real de cada
     amostra é calculado aqui: agora - (enviado_ms - t).
@@ -121,33 +200,29 @@ def receber_leituras():
     if len(leituras) > MAX_LOTE:
         return _erro(f"No máximo {MAX_LOTE} leituras por lote")
 
+    chaves = ("t", *g.campos)
     agora = datetime.now(timezone.utc)
     linhas = []
     for i, l in enumerate(leituras):
-        if not isinstance(l, dict) or not all(_numero(l.get(k)) for k in ("t", "x", "y", "z")):
-            return _erro(f"Leitura {i} inválida: precisa de t, x, y, z numéricos")
+        if not isinstance(l, dict) or not all(_numero(l.get(k)) for k in chaves):
+            return _erro(f"Leitura {i} inválida: precisa de {', '.join(chaves)} numéricos")
         # millis() é unsigned 32 bits e volta a zero a cada ~49 dias; o módulo trata a virada.
         atraso_ms = (int(enviado_ms) - int(l["t"])) % 2**32
         if atraso_ms > MAX_ATRASO_MS:
             atraso_ms = 0
-        linhas.append({
-            "device_id": device_id,
-            "ts": agora - timedelta(milliseconds=atraso_ms),
-            "x": float(l["x"]),
-            "y": float(l["y"]),
-            "z": float(l["z"]),
-        })
+        linha = {"device_id": device_id, "ts": agora - timedelta(milliseconds=atraso_ms)}
+        linha.update((c, float(l[c])) for c in g.campos)
+        linhas.append(linha)
 
-    db.session.execute(insert(Leitura), linhas)
+    db.session.execute(insert(g.bruto), linhas)
     db.session.commit()
     return jsonify({"inseridas": len(linhas)}), 201
 
 
 # --------------------------------------------------------------------------- consultas
 
-@api_bp.get("/dispositivos")
-def listar_dispositivos():
-    A = Leitura1s
+def _dispositivos(g):
+    A = g.agregado
     stmt = (
         select(A.device_id, func.sum(A.n), func.max(A.bucket))
         .group_by(A.device_id)
@@ -159,15 +234,15 @@ def listar_dispositivos():
     ])
 
 
-@api_bp.get("/leituras")
-def listar_leituras():
+def _pontos(g):
     """Pontos para o gráfico do histórico; agrega por média se passar de MAX_PONTOS."""
     inicio, fim, device = _params()
-    brutos = _conds_brutos(inicio, fim, device)
+    L = g.bruto
+    brutos = _conds_brutos(g, inicio, fim, device)
 
     if _usa_agregado(inicio, fim):
-        A = Leitura1s
-        conds = _conds_agregado(inicio, fim, device)
+        A = g.agregado
+        conds = _conds_agregado(g, inicio, fim, device)
         total, primeiro, ultimo = db.session.execute(
             select(func.sum(A.n), func.min(A.bucket), func.max(A.bucket)).where(*conds)
         ).one()
@@ -176,36 +251,28 @@ def listar_leituras():
             balde = max((ultimo - primeiro) / MAX_PONTOS, timedelta(seconds=1))
             b = func.time_bucket(balde, A.bucket).label("b")
             n = func.sum(A.n)
-            stmt = (
-                select(b, func.sum(A.x_soma) / n, func.sum(A.y_soma) / n, func.sum(A.z_soma) / n)
-                .where(*conds)
-                .group_by(b)
-                .order_by(b)
-            )
-            return _resposta_pontos(stmt, total, balde)
+            medias = [func.sum(getattr(A, f"{c}_soma")) / n for c in g.campos]
+            stmt = select(b, *medias).where(*conds).group_by(b).order_by(b)
+            return _resposta_pontos(g, stmt, total, balde)
     else:
         total, primeiro, ultimo = db.session.execute(
-            select(func.count(), func.min(Leitura.ts), func.max(Leitura.ts)).where(*brutos)
+            select(func.count(), func.min(L.ts), func.max(L.ts)).where(*brutos)
         ).one()
         if total > MAX_PONTOS:
             balde = max((ultimo - primeiro) / MAX_PONTOS, timedelta(milliseconds=1))
-            b = func.time_bucket(balde, Leitura.ts).label("b")
-            stmt = (
-                select(b, func.avg(Leitura.x), func.avg(Leitura.y), func.avg(Leitura.z))
-                .where(*brutos)
-                .group_by(b)
-                .order_by(b)
-            )
-            return _resposta_pontos(stmt, total, balde)
+            b = func.time_bucket(balde, L.ts).label("b")
+            medias = [func.avg(col) for col in g.colunas(L)]
+            stmt = select(b, *medias).where(*brutos).group_by(b).order_by(b)
+            return _resposta_pontos(g, stmt, total, balde)
 
-    stmt = select(Leitura.ts, Leitura.x, Leitura.y, Leitura.z).where(*brutos).order_by(Leitura.ts)
-    return _resposta_pontos(stmt, total, None)
+    stmt = select(L.ts, *g.colunas(L)).where(*brutos).order_by(L.ts)
+    return _resposta_pontos(g, stmt, total, None)
 
 
-def _resposta_pontos(stmt, total, balde):
+def _resposta_pontos(g, stmt, total, balde):
     pontos = [
-        {"t": _ms(ts), "x": round(float(x), 4), "y": round(float(y), 4), "z": round(float(z), 4)}
-        for ts, x, y, z in db.session.execute(stmt)
+        {"t": _ms(ts), **{c: round(float(v), 4) for c, v in zip(g.campos, valores)}}
+        for ts, *valores in db.session.execute(stmt)
     ]
     return jsonify({
         "total": total,
@@ -215,19 +282,19 @@ def _resposta_pontos(stmt, total, balde):
     })
 
 
-@api_bp.get("/leituras/recentes")
-def leituras_recentes():
+def _recentes(g):
     """Modo tempo real.
 
     Sem 'apos_id': devolve a última janela (padrão 60 s) até a leitura mais nova.
     Com 'apos_id': devolve só o que foi inserido depois desse id.
     """
+    L = g.bruto
     device = request.args.get("device_id") or None
     apos_id = request.args.get("apos_id", type=int)
     janela_s = min(max(request.args.get("janela_s", 60, type=int), 1), 600)
 
-    conds = [Leitura.device_id == device] if device else []
-    colunas = (Leitura.id, Leitura.ts, Leitura.x, Leitura.y, Leitura.z)
+    conds = [L.device_id == device] if device else []
+    colunas = (L.id, L.ts, *g.colunas(L))
 
     if apos_id:
         # Leituras novas têm ts >= recebimento - MAX_ATRASO_MS; o limite deixa o
@@ -235,22 +302,25 @@ def leituras_recentes():
         limite = datetime.now(timezone.utc) - timedelta(milliseconds=MAX_ATRASO_MS, minutes=10)
         stmt = (
             select(*colunas)
-            .where(*conds, Leitura.id > apos_id, Leitura.ts >= limite)
-            .order_by(Leitura.id)
+            .where(*conds, L.id > apos_id, L.ts >= limite)
+            .order_by(L.id)
         )
     else:
-        ultimo_ts = db.session.scalar(select(func.max(Leitura.ts)).where(*conds))
+        ultimo_ts = db.session.scalar(select(func.max(L.ts)).where(*conds))
         if ultimo_ts is None:
             return jsonify({"ultimo_id": 0, "pontos": []})
         stmt = (
             select(*colunas)
-            .where(*conds, Leitura.ts >= ultimo_ts - timedelta(seconds=janela_s))
-            .order_by(Leitura.ts)
+            .where(*conds, L.ts >= ultimo_ts - timedelta(seconds=janela_s))
+            .order_by(L.ts)
         )
 
     linhas = db.session.execute(stmt.limit(LIMITE_RECENTES)).all()
     ultimo_id = max((linha.id for linha in linhas), default=apos_id or 0)
-    pontos = [{"t": _ms(ts), "x": x, "y": y, "z": z} for _, ts, x, y, z in linhas]
+    pontos = [
+        {"t": _ms(ts), **dict(zip(g.campos, valores))}
+        for _, ts, *valores in linhas
+    ]
     return jsonify({"ultimo_id": ultimo_id, "pontos": pontos})
 
 
@@ -258,66 +328,66 @@ def _f(v):
     return None if v is None else float(v)
 
 
-def _estatisticas_brutas(conds):
+def _estatisticas_brutas(g, conds):
     agregados = [func.count()]
-    for col in (Leitura.x, Leitura.y, Leitura.z):
+    for col in g.colunas(g.bruto):
         agregados += [func.min(col), func.max(col), func.avg(col), func.stddev_samp(col)]
     linha = db.session.execute(select(*agregados).where(*conds)).one()
 
-    eixos = {}
-    for i, nome in enumerate("xyz"):
+    campos = {}
+    for i, nome in enumerate(g.campos):
         mn, mx, media, desvio = linha[1 + i * 4: 5 + i * 4]
-        eixos[nome] = {"min": _f(mn), "max": _f(mx), "media": _f(media), "desvio": _f(desvio)}
-    return linha[0], eixos
+        campos[nome] = {"min": _f(mn), "max": _f(mx), "media": _f(media), "desvio": _f(desvio)}
+    return linha[0], campos
 
 
-def _estatisticas_agregadas(conds):
+def _estatisticas_agregadas(g, conds):
     """Combina os baldes de 1 s: média = Σx/n, variância = (Σx² - (Σx)²/n)/(n-1)."""
-    A = Leitura1s
+    A = g.agregado
     agregados = [func.sum(A.n)]
-    for e in "xyz":
+    for c in g.campos:
         agregados += [
-            func.min(getattr(A, f"{e}_min")), func.max(getattr(A, f"{e}_max")),
-            func.sum(getattr(A, f"{e}_soma")), func.sum(getattr(A, f"{e}_quad")),
+            func.min(getattr(A, f"{c}_min")), func.max(getattr(A, f"{c}_max")),
+            func.sum(getattr(A, f"{c}_soma")), func.sum(getattr(A, f"{c}_quad")),
         ]
     linha = db.session.execute(select(*agregados).where(*conds)).one()
     n = int(linha[0] or 0)
 
-    eixos = {}
-    for i, nome in enumerate("xyz"):
+    campos = {}
+    for i, nome in enumerate(g.campos):
         mn, mx, soma, quad = (_f(v) for v in linha[1 + i * 4: 5 + i * 4])
         media = soma / n if n else None
         desvio = math.sqrt(max((quad - soma * soma / n) / (n - 1), 0.0)) if n > 1 else None
-        eixos[nome] = {"min": mn, "max": mx, "media": media, "desvio": desvio}
-    return n, eixos
+        campos[nome] = {"min": mn, "max": mx, "media": media, "desvio": desvio}
+    return n, campos
 
 
-@api_bp.get("/estatisticas")
-def estatisticas():
+def _estatisticas(g):
     inicio, fim, device = _params()
-    brutos = _conds_brutos(inicio, fim, device)
+    L = g.bruto
+    brutos = _conds_brutos(g, inicio, fim, device)
     if _usa_agregado(inicio, fim):
-        total, eixos = _estatisticas_agregadas(_conds_agregado(inicio, fim, device))
+        total, campos = _estatisticas_agregadas(g, _conds_agregado(g, inicio, fim, device))
     else:
-        total, eixos = _estatisticas_brutas(brutos)
-    resultado = {"total": total, "eixos": eixos}
+        total, campos = _estatisticas_brutas(g, brutos)
+    resultado = {"total": total, "campos": campos}
 
     ultima = db.session.execute(
-        select(Leitura.ts, Leitura.x, Leitura.y, Leitura.z)
+        select(L.ts, *g.colunas(L))
         .where(*brutos)
-        .order_by(Leitura.ts.desc())
+        .order_by(L.ts.desc())
         .limit(1)
     ).first()
     resultado["ultima"] = (
-        {"t": _ms(ultima.ts), "x": ultima.x, "y": ultima.y, "z": ultima.z} if ultima else None
+        {"t": _ms(ultima[0]), **dict(zip(g.campos, ultima[1:]))} if ultima else None
     )
     return jsonify(resultado)
 
 
-@api_bp.get("/leituras.csv")
-def exportar_csv():
+def _csv(g):
     """CSV em streaming. ?excel=1 usa ';' e vírgula decimal (Excel em português)."""
-    conds = _conds_brutos(*_params())
+    L = g.bruto
+    conds = _conds_brutos(g, *_params())
     excel = request.args.get("excel") == "1"
     sep = ";" if excel else ","
 
@@ -326,9 +396,9 @@ def exportar_csv():
         return s.replace(".", ",") if excel else s
 
     stmt = (
-        select(Leitura.ts, Leitura.device_id, Leitura.x, Leitura.y, Leitura.z)
+        select(L.ts, L.device_id, *g.colunas(L))
         .where(*conds)
-        .order_by(Leitura.ts)
+        .order_by(L.ts)
         .execution_options(yield_per=5000)
     )
 
@@ -337,16 +407,16 @@ def exportar_csv():
         w = csv.writer(buf, delimiter=sep)
         if excel:
             buf.write("﻿")  # BOM para o Excel reconhecer UTF-8
-        w.writerow(["ts", "device_id", "x", "y", "z"])
-        for i, (ts, device_id, x, y, z) in enumerate(db.session.execute(stmt), 1):
-            w.writerow([ts.isoformat(timespec="milliseconds"), device_id, num(x), num(y), num(z)])
+        w.writerow(["ts", "device_id", *g.campos])
+        for i, (ts, device_id, *valores) in enumerate(db.session.execute(stmt), 1):
+            w.writerow([ts.isoformat(timespec="milliseconds"), device_id, *map(num, valores)])
             if i % 1000 == 0:
                 yield buf.getvalue()
                 buf.seek(0)
                 buf.truncate()
         yield buf.getvalue()
 
-    nome = f"leituras_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    nome = f"{g.nome}_{datetime.now():%Y%m%d_%H%M%S}.csv"
     return Response(
         stream_with_context(gerar()),
         mimetype="text/csv",

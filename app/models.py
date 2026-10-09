@@ -61,3 +61,49 @@ class Leitura1s(db.Model):
     z_max: Mapped[float] = mapped_column(REAL)
     z_soma: Mapped[float] = mapped_column(Double)
     z_quad: Mapped[float] = mapped_column(Double)
+
+
+class LeituraEnergia(db.Model):
+    """Uma amostra elétrica (V, A, W) enviada pelo microcontrolador com o PZEM-004T.
+
+    Mesma estrutura de 'leituras': hypertable particionada por 'ts' (ver timescale.py).
+    """
+
+    __tablename__ = "leituras_energia"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    tensao: Mapped[float] = mapped_column(REAL, nullable=False)
+    corrente: Mapped[float] = mapped_column(REAL, nullable=False)
+    potencia: Mapped[float] = mapped_column(REAL, nullable=False)
+    recebido_em: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_leituras_energia_device_ts", "device_id", "ts"),
+        Index("ix_leituras_energia_ts", "ts"),
+    )
+
+
+class LeituraEnergia1s(db.Model):
+    """Agregado contínuo de 'leituras_energia' por segundo (ver Leitura1s)."""
+
+    __tablename__ = "leituras_energia_1s"
+
+    bucket: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    n: Mapped[int] = mapped_column(BigInteger)
+    tensao_min: Mapped[float] = mapped_column(REAL)
+    tensao_max: Mapped[float] = mapped_column(REAL)
+    tensao_soma: Mapped[float] = mapped_column(Double)
+    tensao_quad: Mapped[float] = mapped_column(Double)
+    corrente_min: Mapped[float] = mapped_column(REAL)
+    corrente_max: Mapped[float] = mapped_column(REAL)
+    corrente_soma: Mapped[float] = mapped_column(Double)
+    corrente_quad: Mapped[float] = mapped_column(Double)
+    potencia_min: Mapped[float] = mapped_column(REAL)
+    potencia_max: Mapped[float] = mapped_column(REAL)
+    potencia_soma: Mapped[float] = mapped_column(Double)
+    potencia_quad: Mapped[float] = mapped_column(Double)

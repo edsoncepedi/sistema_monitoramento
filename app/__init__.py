@@ -6,7 +6,7 @@ from flask import Flask
 from sqlalchemy.exc import OperationalError
 
 from . import timescale
-from .models import Leitura, db
+from .models import Leitura, LeituraEnergia, db
 
 log = logging.getLogger(__name__)
 
@@ -37,13 +37,14 @@ def create_app():
 
 
 def _criar_tabelas(app, tentativas=10):
-    """Cria a tabela e a estrutura do TimescaleDB, esperando o Postgres ficar disponível."""
+    """Cria as tabelas e a estrutura do TimescaleDB, esperando o Postgres ficar disponível."""
     with app.app_context():
         for tentativa in range(1, tentativas + 1):
             try:
                 with db.engine.begin() as conn:
-                    # Só 'leituras': 'leituras_1s' é um agregado contínuo criado pelo timescale.py.
+                    # Só as tabelas brutas: os agregados *_1s são criados pelo timescale.py.
                     Leitura.__table__.create(conn, checkfirst=True)
+                    LeituraEnergia.__table__.create(conn, checkfirst=True)
                     timescale.configurar(conn)
                 return
             except OperationalError:

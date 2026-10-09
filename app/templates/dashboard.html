@@ -3,62 +3,31 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dashboard de Aceleração</title>
+  <title>Dashboard de Monitoramento</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 </head>
 <body>
   <header class="topo">
-    <h1>Aceleração – MPU6050</h1>
+    <h1>Monitoramento – Aceleração e Energia</h1>
     <span id="status" class="status">Carregando…</span>
   </header>
 
   <main>
-    <section class="filtros">
-      <label>Dispositivo
-        <select id="dispositivo"></select>
-      </label>
+    <!-- Modo, período e zoom valem para todos os gráficos da página. -->
+    <section class="barra">
+      <div class="filtros">
+        <div class="abas" role="tablist">
+          <button type="button" class="aba ativa" data-modo="tempo-real" role="tab">Tempo real</button>
+          <button type="button" class="aba" data-modo="historico" role="tab">Histórico</button>
+        </div>
 
-      <div class="abas" role="tablist">
-        <button type="button" class="aba ativa" data-modo="tempo-real" role="tab">Tempo real</button>
-        <button type="button" class="aba" data-modo="historico" role="tab">Histórico</button>
+        <div id="controles-historico" class="periodo" hidden>
+          <label>Início <input type="datetime-local" id="inicio" step="1"></label>
+          <label>Fim <input type="datetime-local" id="fim" step="1"></label>
+          <button type="button" id="aplicar" class="botao">Aplicar</button>
+        </div>
       </div>
 
-      <div id="controles-historico" class="periodo" hidden>
-        <label>Início <input type="datetime-local" id="inicio" step="1"></label>
-        <label>Fim <input type="datetime-local" id="fim" step="1"></label>
-        <button type="button" id="aplicar" class="botao">Aplicar</button>
-      </div>
-
-      <div class="exportar">
-        <a id="csv" class="botao secundario" href="#">Exportar CSV</a>
-        <a id="csv-excel" class="botao secundario" href="#" title="Separador ; e vírgula decimal">CSV (Excel)</a>
-      </div>
-    </section>
-
-    <section class="cards">
-      <article class="card">
-        <h2>Leituras no período</h2>
-        <p class="valor" id="card-total">–</p>
-      </article>
-      <article class="card">
-        <h2>Total armazenado</h2>
-        <p class="valor" id="card-armazenado">–</p>
-      </article>
-      <article class="card card-largo">
-        <h2>Última leitura <span id="card-ultima-hora" class="sub"></span></h2>
-        <p class="valor eixos">
-          <span><i class="chip chip-x"></i>X <b id="ultimo-x">–</b></span>
-          <span><i class="chip chip-y"></i>Y <b id="ultimo-y">–</b></span>
-          <span><i class="chip chip-z"></i>Z <b id="ultimo-z">–</b></span>
-        </p>
-      </article>
-    </section>
-
-    <section class="painel">
-      <div class="painel-cabecalho">
-        <h2>Aceleração (m/s²)</h2>
-        <span id="nota-grafico" class="sub"></span>
-      </div>
       <div id="ferramentas" class="ferramentas" hidden>
         <div class="grupo" role="group" aria-label="Período rápido">
           <button type="button" class="opcao" data-minutos="15">15 min</button>
@@ -77,24 +46,115 @@
           <button type="button" class="opcao" id="redefinir" title="Voltar ao período original">Redefinir</button>
         </div>
       </div>
-      <div class="grafico">
-        <canvas id="grafico"></canvas>
-        <div id="selecao" class="selecao" hidden></div>
-      </div>
       <p id="dica-grafico" class="dica"></p>
     </section>
 
-    <section class="painel">
-      <h2>Estatísticas do período</h2>
-      <div class="tabela-rolagem">
-        <table class="tabela">
-          <thead>
-            <tr><th>Eixo</th><th>Mínimo</th><th>Máximo</th><th>Média</th><th>Desvio padrão</th></tr>
-          </thead>
-          <tbody id="tabela-stats">
-            <tr><td colspan="5" class="vazio">Sem dados</td></tr>
-          </tbody>
-        </table>
+    <!-- ------------------------------------------------------------ aceleração -->
+    <section class="bloco" aria-labelledby="acel-titulo">
+      <div class="bloco-cabecalho">
+        <h2 id="acel-titulo" class="bloco-titulo">Aceleração <span class="sub">MPU6050</span></h2>
+        <label>Dispositivo <select id="acel-dispositivo"></select></label>
+        <div class="exportar">
+          <a id="acel-csv" class="botao secundario" href="#">Exportar CSV</a>
+          <a id="acel-csv-excel" class="botao secundario" href="#" title="Separador ; e vírgula decimal">CSV (Excel)</a>
+        </div>
+      </div>
+
+      <div class="cards">
+        <article class="card">
+          <h3>Leituras no período</h3>
+          <p class="valor" id="acel-total">–</p>
+        </article>
+        <article class="card">
+          <h3>Total armazenado</h3>
+          <p class="valor" id="acel-armazenado">–</p>
+        </article>
+        <article class="card card-largo">
+          <h3>Última leitura <span id="acel-ultima-hora" class="sub"></span></h3>
+          <p class="valor eixos" id="acel-ultima"></p>
+        </article>
+      </div>
+
+      <div class="painel">
+        <div class="painel-cabecalho">
+          <h3>Aceleração (m/s²)</h3>
+          <span id="acel-nota" class="sub"></span>
+        </div>
+        <div class="grafico"><canvas id="acel-grafico"></canvas></div>
+      </div>
+
+      <div class="painel">
+        <h3>Estatísticas do período</h3>
+        <div class="tabela-rolagem">
+          <table class="tabela">
+            <thead>
+              <tr><th>Eixo</th><th>Mínimo</th><th>Máximo</th><th>Média</th><th>Desvio padrão</th></tr>
+            </thead>
+            <tbody id="acel-stats">
+              <tr><td colspan="5" class="vazio">Sem dados</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------ energia -->
+    <section class="bloco" aria-labelledby="energia-titulo">
+      <div class="bloco-cabecalho">
+        <h2 id="energia-titulo" class="bloco-titulo">Energia <span class="sub">PZEM-004T</span></h2>
+        <label>Dispositivo <select id="energia-dispositivo"></select></label>
+        <div class="exportar">
+          <a id="energia-csv" class="botao secundario" href="#">Exportar CSV</a>
+          <a id="energia-csv-excel" class="botao secundario" href="#" title="Separador ; e vírgula decimal">CSV (Excel)</a>
+        </div>
+      </div>
+
+      <div class="cards">
+        <article class="card">
+          <h3>Leituras no período</h3>
+          <p class="valor" id="energia-total">–</p>
+        </article>
+        <article class="card">
+          <h3>Total armazenado</h3>
+          <p class="valor" id="energia-armazenado">–</p>
+        </article>
+        <article class="card card-largo">
+          <h3>Última leitura <span id="energia-ultima-hora" class="sub"></span></h3>
+          <p class="valor eixos" id="energia-ultima"></p>
+        </article>
+      </div>
+
+      <div class="painel">
+        <div class="painel-cabecalho">
+          <h3>Tensão, corrente e potência</h3>
+          <span id="energia-nota" class="sub"></span>
+        </div>
+        <div class="grafico-item">
+          <h4>Tensão (V)</h4>
+          <div class="grafico compacto"><canvas id="energia-tensao"></canvas></div>
+        </div>
+        <div class="grafico-item">
+          <h4>Corrente (A)</h4>
+          <div class="grafico compacto"><canvas id="energia-corrente"></canvas></div>
+        </div>
+        <div class="grafico-item">
+          <h4>Potência (W)</h4>
+          <div class="grafico compacto"><canvas id="energia-potencia"></canvas></div>
+        </div>
+      </div>
+
+      <div class="painel">
+        <h3>Estatísticas do período</h3>
+        <div class="tabela-rolagem">
+          <table class="tabela">
+            <thead>
+              <tr><th>Grandeza</th><th>Mínimo</th><th>Máximo</th><th>Média</th><th>Desvio padrão</th></tr>
+            </thead>
+            <tbody id="energia-stats">
+              <tr><td colspan="5" class="vazio">Sem dados</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   </main>
