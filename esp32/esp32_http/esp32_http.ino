@@ -1,23 +1,31 @@
-// ESP32 + MPU6050 -> API Flask (POST em lotes)
+// ESP32 + MPU6050 -> API Flask
+// WiFi configurado pelo WiFiManager
 //
-// Bibliotecas (Arduino IDE > Gerenciador de Bibliotecas):
-//   - Adafruit MPU6050
-//   - Adafruit Unified Sensor
-// WiFi.h e HTTPClient.h já vêm com o pacote de placas ESP32.
+// Bibliotecas:
+// - WiFiManager
+// - Adafruit MPU6050
+// - Adafruit Unified Sensor
 //
-// Ligação I2C padrão do ESP32: SDA = GPIO21, SCL = GPIO22.
+// Bibliotecas já fornecidas pelo core ESP32:
+// - WiFi.h
+// - HTTPClient.h
+//
+// Ligação I2C padrão do ESP32:
+// MPU6050 SDA -> GPIO21
+// MPU6050 SCL -> GPIO22
+// VCC -> 3V3
+// GND -> GND
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiManager.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
 
 // ----------------------------------------------------------------- configuração
-#define WIFI_SSID      "Nome_da_rede"
-#define WIFI_PASSWORD  "Senha_da_rede"
-#define SERVER_URL     "http://192.168.0.100:5000/api/leituras"   // IP do PC que roda o Docker
+#define SERVER_URL     "http://172.16.10.68:5001/api/leituras"   // IP do PC que roda o Docker
 #define API_KEY        "troque-esta-chave"                        // igual ao API_KEY do .env
 #define DEVICE_ID      "esp32-01"
 
@@ -26,6 +34,10 @@
 #define TIMEOUT_HTTP_MS       3000
 #define INTERVALO_RECONEXAO_MS 5000
 
+// Tempo máximo do portal WiFiManager.
+// 180 segundos = 3 minutos.
+#define TIMEOUT_CONFIG_WIFI 180
+
 // ----------------------------------------------------------------- estado
 struct Amostra {
   unsigned long t;   // millis() no momento da leitura
@@ -33,7 +45,9 @@ struct Amostra {
 };
 
 Amostra lote[TAMANHO_LOTE];
+
 int qtdAmostras = 0;
+
 unsigned long ultimaAmostra = 0;
 unsigned long ultimaReconexao = 0;
 
@@ -41,22 +55,37 @@ unsigned long ultimaReconexao = 0;
 char json[4096];
 
 Adafruit_MPU6050 mpu;
+
 HTTPClient http;
 
 // ----------------------------------------------------------------- funções
 void conectarWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("Conectando ao wifi");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
+  // Permite que o ESP32 tente reconectar automaticamente
+  // caso a conexão seja perdida.
+  WiFi.setAutoReconnect(true);
+  WiFiManager wifiManager;
+
+  // Se não houver credenciais salvas, o ESP32
+  // criará um Access Point para configuração.
+
+  wifiManager.setConfigPortalTimeout(TIMEOUT_CONFIG_WIFI);
+
+  //Serial.println();
+  //Serial.println("Iniciando WiFiManager...");
+
+  if (!wifiManager.autoConnect("Sensor IoT CEPEDI", "CEPEDI123")) {
+    //Serial.println();
+    //Serial.println("Falha na configuração do WiFi.");
+    //Serial.println("Reiniciando ESP32...");
+    delay(3000);
+    ESP.restart();
+  } else {
+    //Serial.println();
+    //Serial.print("Conectado. IP: ");
+    //Serial.println(WiFi.localIP());
   }
-  Serial.println();
-  Serial.print("Conectado. IP: ");
-  Serial.println(WiFi.localIP());
 }
 
 // Monta {"device_id":..,"enviado_ms":..,"leituras":[{"t":..,"x":..,"y":..,"z":..},...]}
@@ -79,7 +108,7 @@ int montarJson() {
 
 void enviarLote() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi desconectado, lote descartado");
+    //Serial.println("WiFi desconectado, lote descartado");
     if (millis() - ultimaReconexao > INTERVALO_RECONEXAO_MS) {
       ultimaReconexao = millis();
       WiFi.reconnect();
@@ -89,7 +118,7 @@ void enviarLote() {
 
   int tamanho = montarJson();
   if (tamanho < 0) {
-    Serial.println("JSON maior que o buffer, lote descartado");
+    //Serial.println("JSON maior que o buffer, lote descartado");
     return;
   }
 
@@ -115,16 +144,18 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
+  // ---------------------------------------------------------------
+  // WIFI
   conectarWiFi();
 
-  Serial.println("Adafruit MPU6050 test!");
+  //Serial.println("Adafruit MPU6050 test!");
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
     while (1) {
       delay(10);
     }
   }
-  Serial.println("MPU6050 Found!");
+  //Serial.println("MPU6050 Found!");
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
@@ -142,6 +173,7 @@ void loop() {
     float x = a.acceleration.x;
     float y = a.acceleration.y;
     float z = a.acceleration.z;
+
     if (!isnan(x) && !isnan(y) && !isnan(z)) {
       lote[qtdAmostras++] = {agora, x, y, z};
     }
